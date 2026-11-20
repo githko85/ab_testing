@@ -1,0 +1,306 @@
+---
+title: "FaceZonGoogAppFlix Webpage Redesign"
+subtitle: "Executive Summary: A/B Test Results & Strategic Recommendations"
+author: "Data Science Consulting Team"
+date: last-modified
+format:
+  html:
+    theme: cosmo
+    toc: false
+    code-fold: false
+    embed-resources: true
+    df-print: paged
+execute:
+  echo: false
+  warning: false
+  message: false
+jupyter: python3
+---
+
+```{python}
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+sns.set_theme(style="whitegrid", context="notebook")
+COLORS = {
+    "control": "#2b5c8f",
+    "treatment": "#d95f02",
+    "accent": "#2a9d8f",
+    "danger": "#c1121f",
+    "neutral": "#4a4e69",
+}
+
+# Load and apply finalized Phase 2 cleaning rules
+DATA_PATH = Path("ab_data.csv") / "ab_data.csv"
+raw_df = pd.read_csv(DATA_PATH)
+raw_df["ts"] = pd.to_datetime(raw_df["timestamp"])
+
+is_aligned = (
+    ((raw_df["group"] == "control") & (raw_df["landing_page"] == "old_page"))
+    | ((raw_df["group"] == "treatment") & (raw_df["landing_page"] == "new_page"))
+)
+clean_df = (
+    raw_df.loc[is_aligned]
+    .sort_values("ts", ascending=True)
+    .drop_duplicates(subset="user_id", keep="first")
+    .reset_index(drop=True)
+)
+
+# Core metrics
+control = clean_df[clean_df["group"] == "control"]["converted"]
+treatment = clean_df[clean_df["group"] == "treatment"]["converted"]
+
+n_c, x_c = len(control), int(control.sum())
+n_t, x_t = len(treatment), int(treatment.sum())
+p_c, p_t = x_c / n_c, x_t / n_t
+N_total = n_c + n_t
+n_avg = N_total / 2
+
+diff_abs = p_t - p_c
+rel_lift = diff_abs / p_c
+
+# Hypothesis test (two-sided, alpha = 0.05)
+alpha = 0.05
+z_crit = stats.norm.ppf(1 - alpha / 2)
+z_beta = stats.norm.ppf(0.80)
+
+p_pool = (x_c + x_t) / N_total
+se_pool = math.sqrt(p_pool * (1 - p_pool) * (1 / n_c + 1 / n_t))
+z_stat = diff_abs / se_pool
+p_val_2s = 2 * stats.norm.cdf(-abs(z_stat))
+
+# 95% CI for relative lift (Delta Method)
+var_c = p_c * (1 - p_c) / n_c
+var_t = p_t * (1 - p_t) / n_t
+se_rel_delta = math.sqrt(var_t / (p_c ** 2) + (p_t ** 2) * var_c / (p_c ** 4))
+ci_rel_low = rel_lift - z_crit * se_rel_delta
+ci_rel_high = rel_lift + z_crit * se_rel_delta
+
+# Power calculations (baseline p0 = 12%, target = +0.35% relative)
+p0 = 0.12
+rel_target = 0.0035
+elapsed_days = (clean_df["ts"].max() - clean_df["ts"].min()).total_seconds() / 86400
+daily_users = N_total / elapsed_days
+
+def calc_two_sided_power(p_base: float, rel_effect: float, n_per_arm: float, alpha_lvl: float = 0.05) -> float:
+    p_treat = p_base * (1 + rel_effect)
+    delta = p_treat - p_base
+    zc = stats.norm.ppf(1 - alpha_lvl / 2)
+    se0 = math.sqrt(2 * p_base * (1 - p_base) / n_per_arm)
+    se1 = math.sqrt((p_base * (1 - p_base) + p_treat * (1 - p_treat)) / n_per_arm)
+    return (1 - stats.norm.cdf((zc * se0 - delta) / se1)) + stats.norm.cdf((-zc * se0 - delta) / se1)
+
+def required_total_users(p_base: float, rel_effect: float, alpha_lvl: float = 0.05, power_lvl: float = 0.80) -> float:
+    p_treat = p_base * (1 + rel_effect)
+    delta = p_treat - p_base
+    p_bar = (p_base + p_treat) / 2
+    zc = stats.norm.ppf(1 - alpha_lvl / 2)
+    zb = stats.norm.ppf(power_lvl)
+    n_arm = ((zc * math.sqrt(2 * p_bar * (1 - p_bar)) + zb * math.sqrt(p_base * (1 - p_base) + p_treat * (1 - p_treat))) / delta) ** 2
+    return 2 * n_arm
+
+achieved_power_target = calc_two_sided_power(p0, rel_target, n_avg, alpha)
+mde_detectable_abs = (z_crit + z_beta) * math.sqrt(2 * p0 * (1 - p0) / n_avg)
+mde_detectable_rel = mde_detectable_abs / p0
+req_total_target = required_total_users(p0, rel_target)
+req_years_target = (req_total_target / daily_users) / 365.25
+```
+
+## Headline Recommendations
+
+::: {.callout-important}
+### Executive Decision & Strategic Guidance
+
+1. **Do Not Launch `new_page` — Retain `old_page`:** Across **`290,584`** valid unique visitors over 22 days, the redesigned page converted at **`11.88%`** versus **`12.04%`** for the existing page—an observed **`-1.31%` relative change** (95% CI: **`[-3.26%, +0.64%]`**, $p = 0.19$). There is **no statistical evidence** of a conversion lift, and the best estimate trends slightly negative. Keeping `old_page` avoids engineering rollout risk for no demonstrated return.
+2. **Right-Size Future Experiment Targets Before Testing:** FaceZonGoogAppFlix's goal of a **`+0.35%` relative lift** (`12.00%` → `12.042%`) is too small to measure reliably at current traffic—achieving standard `80%` statistical power would require **`~18.8 million` users (`~3.9 years`)**. For a practical 3-week experiment (`~290k` users), future redesigns should focus on bolder changes targeting **`~2.8%+` relative lift**, or incorporate variance-reduction methods (e.g., CUPED).
+:::
+
+### Results at a Glance
+
+```{python}
+kpi_df = pd.DataFrame(
+    {
+        "Metric": [
+            "Clean Sample Size (22-Day Test)",
+            "Control (`old_page`) Conversion Rate",
+            "Treatment (`new_page`) Conversion Rate",
+            "Observed Relative Lift",
+            "95% Confidence Interval (Relative Lift)",
+            "Two-Sided p-Value (α = 0.05)",
+            "Achieved Power for +0.35% Relative Target",
+            "Launch Decision",
+        ],
+        "Result": [
+            f"{N_total:,} unique users ({n_c:,} control / {n_t:,} treatment)",
+            f"{p_c * 100:.2f}% ({x_c:,} conversions)",
+            f"{p_t * 100:.2f}% ({x_t:,} conversions)",
+            f"{rel_lift * 100:+.2f}% ({diff_abs * 100:+.2f} percentage points)",
+            f"[{ci_rel_low * 100:+.2f}%, {ci_rel_high * 100:+.2f}%]",
+            f"{p_val_2s:.4f} (not statistically significant)",
+            f"{achieved_power_target * 100:.1f}% (vs. 80% standard benchmark)",
+            "Retain old_page (Do Not Ship new_page)",
+        ],
+    }
+)
+kpi_df
+```
+
+---
+
+## Recommendation 1 Evidence: No Demonstrated Conversion Lift
+
+- **Observed direction is negative:** `new_page` trailed `old_page` by **`-1.31%` relative** (`-0.16` percentage points).
+- **Confidence interval spans zero:** The 95% confidence interval (`-3.26%` to `+0.64%` relative) comfortably includes `0%`, confirming the observed difference is indistinguishable from random chance ($p = 0.19$).
+- **Nuance on the upper bound:** Because the test lacked statistical power for a `+0.35%` relative target, the upper edge of the 95% CI (`+0.64%`) does not strictly rule out `+0.35%`—however, with a negative point estimate and zero evidence of uplift, launching `new_page` is not supported.
+
+```{python}
+#| fig-cap: "95% confidence interval for the relative conversion lift of new_page vs. old_page. The interval crosses 0% (no statistically significant effect) and centers at -1.31%."
+fig, ax = plt.subplots(figsize=(10.2, 3.4))
+
+# Subtle shaded background: negative vs. positive territory
+ax.axvspan(-4.2, 0, color="#fde8e8", alpha=0.35, zorder=0)
+ax.axvspan(0, 1.8, color="#e6f6f3", alpha=0.35, zorder=0)
+
+# Reference thresholds
+ax.axvline(0, color=COLORS["neutral"], linestyle="--", linewidth=1.6, zorder=2, label="No Effect (0.00%)")
+ax.axvline(
+    rel_target * 100,
+    color=COLORS["accent"],
+    linestyle="-.",
+    linewidth=2.0,
+    zorder=2,
+    label="Client Target (+0.35% relative)",
+)
+
+# 95% CI bar + point estimate
+err_low = (rel_lift - ci_rel_low) * 100
+err_high = (ci_rel_high - rel_lift) * 100
+ax.errorbar(
+    x=rel_lift * 100,
+    y=0,
+    xerr=[[err_low], [err_high]],
+    fmt="o",
+    color=COLORS["treatment"],
+    ecolor=COLORS["treatment"],
+    elinewidth=3.5,
+    capsize=10,
+    capthick=2.5,
+    markersize=10,
+    zorder=4,
+    label=f"Observed: {rel_lift * 100:+.2f}%  |  95% CI: [{ci_rel_low * 100:+.2f}%, {ci_rel_high * 100:+.2f}%]",
+)
+
+# Direct value callouts on the CI bar
+ax.text(ci_rel_low * 100, -0.26, f"{ci_rel_low * 100:+.2f}%", ha="center", va="top", fontsize=9.5, fontweight="bold", color=COLORS["treatment"])
+ax.text(rel_lift * 100, 0.22, f"{rel_lift * 100:+.2f}%", ha="center", va="bottom", fontsize=10, fontweight="bold", color=COLORS["treatment"])
+ax.text(ci_rel_high * 100, -0.26, f"{ci_rel_high * 100:+.2f}%", ha="center", va="top", fontsize=9.5, fontweight="bold", color=COLORS["treatment"])
+
+ax.set_title("95% Confidence Interval — Relative Conversion Lift (new_page vs. old_page)", fontsize=12, fontweight="bold", pad=12)
+ax.set_xlabel("Relative Change in Conversion Rate vs. Control (%)")
+ax.set_yticks([])
+ax.set_xlim(-4.2, 1.8)
+ax.set_ylim(-0.65, 0.78)
+ax.legend(loc="upper left", frameon=True, fontsize=9)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Recommendation 2 Evidence: Why Future Targets Must Be Right-Sized
+
+- **Severe underpowering at `+0.35%` relative lift:** A `+0.35%` relative gain on a `12.00%` baseline equals just **`+0.042` percentage points** (`4.2` extra conversions per `10,000` visitors). With `~145,292` users per arm, this test had only **`6.4%` statistical power** to detect a gain that small—barely above the `5%` false-positive rate.
+- **Practical sizing for future tests:** To reach the standard **`80%` power** benchmark within a 3-week test window (`~290k` users), future page changes need to target at least a **`+2.81%` relative lift** (`12.00%` → `12.34%`).
+
+```{python}
+#| fig-cap: "Statistical power curve for the current sample size (~145,292 users/arm, α = 0.05 two-sided). Achieving 80% power requires roughly a +2.81% relative lift; the +0.35% relative target had only 6.4% power."
+rel_lifts_grid = np.linspace(0.0, 0.045, 300)
+powers_grid = [calc_two_sided_power(p0, r, n_avg, alpha) * 100 for r in rel_lifts_grid]
+
+fig, ax = plt.subplots(figsize=(10.2, 4.5))
+ax.plot(
+    rel_lifts_grid * 100,
+    powers_grid,
+    color=COLORS["control"],
+    linewidth=2.6,
+    label="Achieved Power (n ≈ 145,292 / arm)",
+)
+
+ax.axhline(80, color=COLORS["accent"], linestyle="--", linewidth=1.4, label="80% Industry Power Benchmark")
+ax.axvline(mde_detectable_rel * 100, color=COLORS["accent"], linestyle=":", linewidth=1.4)
+
+# Client target point
+ax.scatter([rel_target * 100], [achieved_power_target * 100], color=COLORS["danger"], s=95, zorder=5)
+ax.annotate(
+    f"Client Target: +0.35% rel\nPower = {achieved_power_target * 100:.1f}% (Needs ~18.8M users)",
+    xy=(rel_target * 100, achieved_power_target * 100),
+    xytext=(0.75, 22),
+    arrowprops={"arrowstyle": "->", "color": COLORS["danger"], "lw": 1.6},
+    fontsize=9.5,
+    fontweight="bold",
+    color=COLORS["danger"],
+    bbox={"boxstyle": "round,pad=0.35", "fc": "#fff5f5", "ec": COLORS["danger"], "alpha": 0.96},
+)
+
+# 80% power intersection
+ax.scatter([mde_detectable_rel * 100], [80], color=COLORS["accent"], s=95, zorder=5)
+ax.annotate(
+    f"80% Power Reached at\n+{mde_detectable_rel * 100:.2f}% rel (+{mde_detectable_abs * 100:.2f} pp)",
+    xy=(mde_detectable_rel * 100, 80),
+    xytext=(2.95, 56),
+    arrowprops={"arrowstyle": "->", "color": COLORS["accent"], "lw": 1.6},
+    fontsize=9.5,
+    fontweight="bold",
+    color="#1b6b60",
+    bbox={"boxstyle": "round,pad=0.35", "fc": "#f0fbf9", "ec": COLORS["accent"], "alpha": 0.96},
+)
+
+ax.set_title("Statistical Power Curve: Detectable Lift at Current Traffic Volume", fontsize=12, fontweight="bold", pad=10)
+ax.set_xlabel("True Relative Lift Over 12% Baseline (%)")
+ax.set_ylabel("Statistical Power (%)")
+ax.set_xlim(0, 4.5)
+ax.set_ylim(0, 105)
+ax.legend(loc="lower right", frameon=True, fontsize=9)
+plt.tight_layout()
+plt.show()
+```
+
+### Planning Guide for Future Experiments (80% Power, $\alpha = 0.05$)
+
+```{python}
+scenarios = [
+    ("Current Target (+0.35% relative)", 0.0035),
+    ("Moderate Target (+1.00% relative)", 0.0100),
+    ("Current 3-Week Capacity (+2.81% relative)", mde_detectable_rel),
+]
+
+rows = []
+for label, rel_eff in scenarios:
+    req_tot = required_total_users(p0, rel_eff)
+    days = req_tot / daily_users
+    runtime_str = f"~{days / 365.25:.1f} years" if days >= 365 else (f"~{days / 30.4:.1f} months" if days >= 60 else f"~{days:.0f} days")
+    rows.append(
+        {
+            "Target Scenario": label,
+            "Target Rate": f"{p0 * (1 + rel_eff) * 100:.3f}%",
+            "Required Total Users": f"{req_tot:,.0f}",
+            "Est. Runtime (~13.2k users/day)": runtime_str,
+        }
+    )
+pd.DataFrame(rows)
+```
+
+---
+
+## Immediate Next Steps
+
+1. **Keep `old_page` in production** and archive the `new_page` variant rather than shipping an unproven redesign.
+2. **Adopt pre-test power sizing** using the planning table above—focus design iterations on higher-impact changes (`~2.8%+` relative lift for 3-week tests) or apply variance reduction (e.g., CUPED) when evaluating smaller UX tweaks.
+3. **Resolve the `1.32%` assignment/page logging discrepancy** (`3,893` misaligned records identified during data exploration) with engineering before launching the next A/B test so future telemetry is clean out of the box.
+
+*Supporting technical reports: Phase 1 Initial Data Exploration (`01_initial_data_exploration.html`) and Phase 2 Step-by-Step Statistical Analysis (`02_ab_test_analysis.html`).*
