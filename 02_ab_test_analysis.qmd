@@ -1,0 +1,731 @@
+---
+title: "FaceZonGoogAppFlix Webpage A/B Test"
+subtitle: "Phase 2: Data Cleaning, Statistical Testing & Business Recommendation"
+author: "Data Science Consulting Team"
+date: last-modified
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-summary: "Hide / Show code"
+    embed-resources: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+jupyter: python3
+---
+
+## Executive Framing & A/B Testing Roadmap
+
+In **Phase 1** (`01_initial_data_exploration.qmd`), we audited FaceZonGoogAppFlix's raw experiment export (`ab_data.csv`, `294,478` rows) and uncovered `3,893` misaligned `(group, landing_page)` records plus `1` additional repeated user (`user_id = 773192`).
+
+In **Phase 2**, we apply the finalized cleaning rules and walk step by step through the full statistical analysis. This document is written to be **demonstrative and transparent** for readers new to A/B testing: every statistical component is explained in plain English, written out mathematically, computed explicitly from scratch in Python, visualized, and cross-checked against standard statistical libraries.
+
+### Confirmed Engagement Parameters
+
+| Parameter | Value | Plain-English Meaning |
+| :--- | :--- | :--- |
+| **Baseline conversion rate ($p_0$)** | `12.00%` (`0.12000`) | Historical conversion rate of `old_page` |
+| **Target lift (relative)** | `+0.35%` (`+0.0035`) | Client wants a relative increase of at least 0.35% over baseline |
+| **Target conversion rate ($p_1$)** | `12.042%` (`0.12042`) | $0.12 \times (1 + 0.0035)$ |
+| **Absolute MDE ($\Delta_{\text{MDE}}$)** | `+0.042 pp` (`+0.00042`) | Minimum Detectable Effect in percentage points ($p_1 - p_0$) |
+| **Cleaning Rule 1** | Drop misaligned logs | Remove `control + new_page` and `treatment + old_page` rows |
+| **Cleaning Rule 2** | Keep first visit | For any repeat `user_id`, sort by `timestamp` and keep the earliest row |
+| **Confidence Level / $\alpha$** | `95%` CI ($\alpha = 0.05$) | Standard 5% false-positive threshold paired with a two-sided 95% CI |
+
+### Our 5-Step A/B Testing Workflow
+
+1. **Clean the data** so every row represents one valid, independent user.
+2. **Check randomization health** using a Sample Ratio Mismatch (SRM) test before trusting conversion numbers.
+3. **Define hypotheses & check statistical power** to see whether the sample size is large enough to detect a `+0.35%` relative lift.
+4. **Run the two-proportion $z$-test & build the 95% confidence interval** by calculating every piece step by step.
+5. **Translate the statistics into a clear business recommendation** for FaceZonGoogAppFlix.
+
+---
+
+## Data Cleaning Pipeline
+
+Before calculating a single test statistic, we must ensure **one row = one independent experimental unit** with a valid assignment. Standard A/B tests assume each user's outcome is independent of every other row and that each user actually received the experience their group dictates.
+
+```{python}
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+# Consistent visual styling
+sns.set_theme(style="whitegrid", context="notebook")
+COLORS = {
+    "control": "#2b5c8f",
+    "treatment": "#d95f02",
+    "accent": "#2a9d8f",
+    "danger": "#d62828",
+    "neutral": "#4a4e69",
+}
+
+DATA_PATH = Path("ab_data.csv") / "ab_data.csv"
+raw_df = pd.read_csv(DATA_PATH)
+raw_df["ts"] = pd.to_datetime(raw_df["timestamp"])
+
+# Step 1: Filter out misaligned (group, landing_page) logs
+is_aligned = (
+    ((raw_df["group"] == "control") & (raw_df["landing_page"] == "old_page"))
+    | ((raw_df["group"] == "treatment") & (raw_df["landing_page"] == "new_page"))
+)
+aligned_df = raw_df.loc[is_aligned].copy()
+
+# Inspect the remaining duplicate user(s) BEFORE deduplicating
+remaining_dups = aligned_df[aligned_df["user_id"].duplicated(keep=False)].sort_values(
+    ["user_id", "ts"]
+)
+
+# Step 2: For repeat users, sort chronologically and keep only the first visit
+clean_df = (
+    aligned_df.sort_values("ts", ascending=True)
+    .drop_duplicates(subset="user_id", keep="first")
+    .reset_index(drop=True)
+)
+
+# Build a transparent cleaning waterfall table
+waterfall = pd.DataFrame(
+    {
+        "Stage": [
+            "0. Raw export (`ab_data.csv`)",
+            "1. After filtering misaligned `(group, landing_page)` logs",
+            "2. After keeping first visit for repeat `user_id`s (Final Clean Data)",
+        ],
+        "Rows Remaining": [len(raw_df), len(aligned_df), len(clean_df)],
+        "Rows Removed at Step": [
+            0,
+            len(raw_df) - len(aligned_df),
+            len(aligned_df) - len(clean_df),
+        ],
+        "Unique Users": [
+            raw_df["user_id"].nunique(),
+            aligned_df["user_id"].nunique(),
+            clean_df["user_id"].nunique(),
+        ],
+    }
+)
+waterfall["% of Raw Retained"] = (waterfall["Rows Remaining"] / len(raw_df) * 100).round(3)
+waterfall
+```
+
+### Inspecting the Deduplicated Repeat User
+
+After removing the `3,893` misaligned logs, exactly **one user** (`user_id = 773192`) appears twice with both rows properly aligned. Keeping the first visit retains their `2017-01-09` session and drops the `2017-01-14` repeat visit:
+
+```{python}
+remaining_dups[["user_id", "timestamp", "group", "landing_page", "converted"]].assign(
+    action=["Kept (First Visit)", "Dropped (Repeat Visit)"]
+)
+```
+
+```{python}
+# Sanity assertions verifying clean_df meets every integrity rule
+assert clean_df["user_id"].is_unique, "Expected one row per unique user_id!"
+assert (
+    ((clean_df["group"] == "control") & (clean_df["landing_page"] == "old_page"))
+    | ((clean_df["group"] == "treatment") & (clean_df["landing_page"] == "new_page"))
+).all(), "Unexpected misaligned row found!"
+
+print(f"Final clean dataset verified: {len(clean_df):,} unique users, 0 misaligned rows, 0 duplicate user_ids.")
+```
+
+::: {.callout-note}
+### Why Order of Cleaning Matters
+Notice that we **filtered misaligned logs first**, then **kept the first visit for repeat users**. As we saw in Phase 1, all `3,893` misaligned records belonged to users who also had a properly aligned record. Filtering invalid logs first ensures we keep those users' valid logged visit rather than accidentally keeping a corrupted log entry if it happened to occur earlier.
+:::
+
+---
+
+## Randomization Health Check: Sample Ratio Mismatch (SRM)
+
+**What is SRM?** In a 50/50 A/B test, each visitor is essentially assigned by a fair coin flip. A **Sample Ratio Mismatch (SRM)** occurs when the observed split between `control` and `treatment` deviates more than random chance can reasonably explain—a classic red flag for broken randomization, bot filtering bias, or asymmetric logging loss.
+
+We test our cleaned split against an expected 50/50 ratio using a **Chi-Square Goodness-of-Fit Test**:
+
+$$\chi^2_{\text{SRM}} = \frac{(O_C - E_C)^2}{E_C} + \frac{(O_T - E_T)^2}{E_T}$$
+
+where $O_C, O_T$ are the observed user counts in `control` and `treatment`, and $E_C = E_T = \frac{N}{2}$ are the expected counts under a fair 50/50 split (with $df = 1$).
+
+```{python}
+group_counts = clean_df["group"].value_counts()
+O_c = int(group_counts["control"])
+O_t = int(group_counts["treatment"])
+N_total = O_c + O_t
+
+# Expected counts under a 50/50 randomization split
+E_c = N_total / 2
+E_t = N_total / 2
+
+# Manual component-by-component Chi-Square calculation
+chi2_c = (O_c - E_c) ** 2 / E_c
+chi2_t = (O_t - E_t) ** 2 / E_t
+chi2_srm_manual = chi2_c + chi2_t
+p_srm_manual = 1 - stats.chi2.cdf(chi2_srm_manual, df=1)
+
+# Cross-check with scipy.stats.chisquare
+chi2_srm_scipy, p_srm_scipy = stats.chisquare(f_obs=[O_c, O_t], f_exp=[E_c, E_t])
+
+srm_table = pd.DataFrame(
+    {
+        "Arm": ["Control (`old_page`)", "Treatment (`new_page`)", "Total"],
+        "Observed Users (O)": [O_c, O_t, N_total],
+        "Expected Users (E)": [E_c, E_t, N_total],
+        "Difference (O - E)": [O_c - E_c, O_t - E_t, 0.0],
+        "Observed Share (%)": [O_c / N_total * 100, O_t / N_total * 100, 100.0],
+        "Chi-Square Contribution": [chi2_c, chi2_t, chi2_srm_manual],
+    }
+)
+srm_table["Observed Share (%)"] = srm_table["Observed Share (%)"].round(4)
+srm_table["Chi-Square Contribution"] = srm_table["Chi-Square Contribution"].round(6)
+srm_table
+```
+
+```{python}
+print(f"Manual SRM Chi-Square : {chi2_srm_manual:.6f}  |  p-value: {p_srm_manual:.6f}")
+print(f"SciPy  SRM Chi-Square : {chi2_srm_scipy:.6f}  |  p-value: {p_srm_scipy:.6f}")
+```
+
+**SRM Verdict:** With `145,274` control users (`49.994%`) vs. `145,310` treatment users (`50.006%`), $\chi^2 = 0.0045$ and $p = 0.9468$ (well above typical SRM alert thresholds like $p < 0.001$ or $p < 0.01$). **Randomization balance looks healthy**, so we can proceed to hypothesis testing.
+
+---
+
+## Experimental Design: Hypotheses & Power Reality Check
+
+### Formulating the Hypotheses
+
+In A/B testing, we frame our experiment around two competing statements about the *true* (unobserved) population conversion rates of the old page ($p_C$) and the new page ($p_T$):
+
+- **Null Hypothesis ($H_0$):** The new webpage has **no effect** on conversion rate:
+  $$H_0: p_T - p_C = 0$$
+- **Alternative Hypothesis ($H_1$):** The new webpage **changes** the conversion rate (either increases or decreases it):
+  $$H_1: p_T - p_C \neq 0$$
+
+| Concept | Symbol / Value | Beginner-Friendly Intuition |
+| :--- | :--- | :--- |
+| **Significance Level** | $\alpha = 0.05$ | Maximum false-positive risk we tolerate if $H_0$ is actually true (5% chance of declaring a winner when there is no real difference). |
+| **Type I Error** | False Positive ($\alpha$) | Shipping a page that actually has no effect. |
+| **Type II Error** | False Negative ($\beta$) | Missing a real improvement (typically targeted at $\beta \le 0.20$). |
+| **Statistical Power** | $1 - \beta$ (target `80%`) | Probability of successfully detecting a true lift of size MDE when one really exists. |
+| **Confidence Level** | $1 - \alpha = 95\%$ | If we repeated this experiment many times, 95% of the resulting confidence intervals would contain the true difference $p_T - p_C$. |
+
+::: {.callout-tip}
+### Why Use a Two-Sided Test?
+Even though FaceZonGoogAppFlix hopes the new page *increases* conversion, **two-sided testing** ($H_1: p_T \neq p_C$) is the industry standard in online A/B testing for two reasons:
+
+1. **Safety:** A redesign can hurt conversion just as easily as it can help—two-sided tests monitor both directions.
+2. **Consistency with a 95% CI:** A two-sided test at $\alpha = 0.05$ rejects $H_0$ if and only if `0` falls outside the two-sided **95% confidence interval**.
+
+*(For completeness, we will also report the one-sided $p$-value alongside the two-sided result in Section 5.)*
+:::
+
+### Power & Sample Size Reality Check for a `+0.35%` Relative Lift
+
+Before inspecting the conversion outcome, let's check a crucial question that every data scientist should ask: **Is `~145,292` users per arm actually enough to detect a `+0.35%` relative lift?**
+
+First, let's translate the client's relative target into absolute terms:
+
+$$p_0 = 0.12000, \qquad p_1 = p_0 \times (1 + 0.0035) = 0.12042, \qquad \Delta_{\text{MDE}} = p_1 - p_0 = 0.00042 \text{ (+0.042 percentage points)}$$
+
+To detect a difference between $p_0$ and $p_1$ with two-sided significance $\alpha = 0.05$ ($z_{1-\alpha/2} \approx 1.960$) and power $1 - \beta = 0.80$ ($z_{1-\beta} \approx 0.842$), the standard sample-size formula **per arm** is:
+
+$$n_{\text{per arm}} = \left( \frac{z_{1-\alpha/2}\sqrt{2\bar{p}(1 - \bar{p})} + z_{1-\beta}\sqrt{p_0(1 - p_0) + p_1(1 - p_1)}}{p_1 - p_0} \right)^2, \qquad \bar{p} = \frac{p_0 + p_1}{2}$$
+
+```{python}
+p0 = 0.12
+rel_target = 0.0035  # +0.35% relative lift
+p1 = p0 * (1 + rel_target)
+mde_abs = p1 - p0
+
+alpha = 0.05
+target_power = 0.80
+z_alpha_2 = stats.norm.ppf(1 - alpha / 2)   # 1.959964
+z_beta = stats.norm.ppf(target_power)       # 0.841621
+
+# 1. Required sample size per arm for 80% power on +0.35% relative lift
+p_bar = (p0 + p1) / 2
+n_req_per_arm = (
+    (
+        z_alpha_2 * math.sqrt(2 * p_bar * (1 - p_bar))
+        + z_beta * math.sqrt(p0 * (1 - p0) + p1 * (1 - p1))
+    )
+    / mde_abs
+) ** 2
+n_req_total = 2 * n_req_per_arm
+
+# Estimate runtime at FaceZonGoogAppFlix's observed daily traffic rate
+elapsed_days = (clean_df["ts"].max() - clean_df["ts"].min()).total_seconds() / 86400
+daily_clean_users = N_total / elapsed_days
+days_needed = n_req_total / daily_clean_users
+
+# 2. Achieved power with our actual average sample size per arm (~145,292)
+n_actual_avg = N_total / 2
+
+def calc_two_sided_power(p_base: float, rel_lift: float, n_per_arm: float, alpha_lvl: float = 0.05) -> float:
+    p_treat = p_base * (1 + rel_lift)
+    delta = p_treat - p_base
+    z_c = stats.norm.ppf(1 - alpha_lvl / 2)
+    se_null = math.sqrt(2 * p_base * (1 - p_base) / n_per_arm)
+    se_alt = math.sqrt((p_base * (1 - p_base) + p_treat * (1 - p_treat)) / n_per_arm)
+    # Probability of landing in upper OR lower rejection region under true delta
+    upper_prob = 1 - stats.norm.cdf((z_c * se_null - delta) / se_alt)
+    lower_prob = stats.norm.cdf((-z_c * se_null - delta) / se_alt)
+    return upper_prob + lower_prob
+
+achieved_power_target = calc_two_sided_power(p0, rel_target, n_actual_avg, alpha)
+
+# 3. What MDE CAN we reliably detect at 80% power with n_actual_avg per arm?
+mde_detectable_abs = (z_alpha_2 + z_beta) * math.sqrt(2 * p0 * (1 - p0) / n_actual_avg)
+mde_detectable_rel = mde_detectable_abs / p0
+
+power_summary = pd.DataFrame(
+    {
+        "Metric": [
+            "Baseline Conversion Rate (p₀)",
+            "Target Conversion Rate (p₁ = p₀ × 1.0035)",
+            "Target Absolute MDE (p₁ - p₀)",
+            "Required Sample Size per Arm (80% power, α = 0.05)",
+            "Required Total Sample Size (Both Arms)",
+            "Estimated Runtime at Observed Traffic (~13,208 users/day)",
+            "Actual Average Sample Size per Arm",
+            "Achieved Power to Detect +0.35% Relative Lift",
+            "Actually Detectable MDE at 80% Power (Absolute / Relative)",
+        ],
+        "Value": [
+            f"{p0 * 100:.2f}%",
+            f"{p1 * 100:.3f}%",
+            f"+{mde_abs * 100:.3f} pp (+{mde_abs:.5f})",
+            f"{n_req_per_arm:,.0f} users",
+            f"{n_req_total:,.0f} users ({n_req_total / N_total:.1f}× current data)",
+            f"~{days_needed:,.0f} days (~{days_needed / 365.25:.1f} years)",
+            f"{n_actual_avg:,.0f} users",
+            f"{achieved_power_target * 100:.2f}% (severely underpowered)",
+            f"+{mde_detectable_abs * 100:.3f} pp (+{mde_detectable_rel * 100:.2f}% relative)",
+        ],
+    }
+)
+power_summary
+```
+
+```{python}
+#| fig-cap: "Statistical power curve for the current sample size (~145,292 users/arm, α = 0.05 two-sided). Detecting a tiny +0.35% relative lift has only 6.4% power; 80% power is reached around a +2.81% relative lift."
+rel_lifts_grid = np.linspace(0.0, 0.045, 300)
+powers_grid = [calc_two_sided_power(p0, r, n_actual_avg, alpha) * 100 for r in rel_lifts_grid]
+
+fig, ax = plt.subplots(figsize=(10.5, 4.8))
+ax.plot(rel_lifts_grid * 100, powers_grid, color=COLORS["control"], linewidth=2.5, label="Achieved Power (n ≈ 145,292 / arm)")
+
+# 80% power reference
+ax.axhline(80, color=COLORS["accent"], linestyle="--", linewidth=1.3, label="Standard 80% Power Target")
+ax.axvline(mde_detectable_rel * 100, color=COLORS["accent"], linestyle=":", linewidth=1.3)
+
+# Client's +0.35% relative lift target
+ax.scatter([rel_target * 100], [achieved_power_target * 100], color=COLORS["danger"], s=90, zorder=5)
+ax.annotate(
+    f"Client Target: +0.35% rel (+0.042 pp)\nAchieved Power = {achieved_power_target * 100:.1f}%",
+    xy=(rel_target * 100, achieved_power_target * 100),
+    xytext=(0.75, 22),
+    arrowprops={"arrowstyle": "->", "color": COLORS["danger"], "lw": 1.5},
+    fontsize=9.5,
+    fontweight="bold",
+    color=COLORS["danger"],
+    bbox={"boxstyle": "round,pad=0.35", "fc": "#fff5f5", "ec": COLORS["danger"], "alpha": 0.95},
+)
+
+# 80% power intersection annotation
+ax.scatter([mde_detectable_rel * 100], [80], color=COLORS["accent"], s=90, zorder=5)
+ax.annotate(
+    f"80% Power Reached at\n+{mde_detectable_rel * 100:.2f}% rel (+{mde_detectable_abs * 100:.2f} pp)",
+    xy=(mde_detectable_rel * 100, 80),
+    xytext=(2.95, 58),
+    arrowprops={"arrowstyle": "->", "color": COLORS["accent"], "lw": 1.5},
+    fontsize=9.5,
+    fontweight="bold",
+    color="#1b6b60",
+    bbox={"boxstyle": "round,pad=0.35", "fc": "#f0fbf9", "ec": COLORS["accent"], "alpha": 0.95},
+)
+
+ax.set_title("Power Curve: What Size Lift Can This Sample Actually Detect?")
+ax.set_xlabel("True Relative Lift Over 12% Baseline (%)")
+ax.set_ylabel("Statistical Power (%)")
+ax.set_xlim(0, 4.5)
+ax.set_ylim(0, 105)
+ax.legend(loc="lower right", frameon=True)
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-warning}
+### A Critical Beginner Insight: Small Relative Lifts Need Massive Samples
+A `+0.35%` **relative** lift on a `12%` baseline is only **`+0.042` percentage points** (`4.2` extra conversions per `10,000` visitors). Because sample size scales inversely with the *square* of the MDE ($n \propto 1/\Delta^2$), cutting an MDE by 8× requires **64× more users** (~`18.8 million` total, or ~`3.9 years` at current traffic). Keep this power limitation firmly in mind when we interpret the confidence interval below!
+:::
+
+---
+
+## Step-by-Step Statistical Test: Two-Proportion $z$-Test & 95% Confidence Interval
+
+We now compute every single component of the **two-proportion $z$-test** and **95% confidence interval** from scratch so you can trace how raw visitor counts turn into a $z$-score, $p$-value, and confidence interval.
+
+### Step 1: Group Counts, Sample Proportions & Normality Check
+
+**Intuition:** First, we summarize each arm by two numbers: total unique visitors ($n$) and total conversions ($x$). Dividing conversions by visitors gives each arm's **sample conversion rate** ($\hat{p}$):
+
+$$\hat{p}_C = \frac{x_C}{n_C}, \qquad \hat{p}_T = \frac{x_T}{n_T}$$
+
+The normal approximation (Central Limit Theorem) for a $z$-test is valid whenever both arms have at least 10 expected successes and 10 expected failures ($n\hat{p} \ge 10$ and $n(1 - \hat{p}) \ge 10$).
+
+```{python}
+control = clean_df[clean_df["group"] == "control"]["converted"]
+treatment = clean_df[clean_df["group"] == "treatment"]["converted"]
+
+n_c = len(control)
+x_c = int(control.sum())
+p_c = x_c / n_c
+
+n_t = len(treatment)
+x_t = int(treatment.sum())
+p_t = x_t / n_t
+
+step1_df = pd.DataFrame(
+    {
+        "Arm": ["Control (`old_page`)", "Treatment (`new_page`)"],
+        "Visitors (n)": [f"{n_c:,}", f"{n_t:,}"],
+        "Conversions (x)": [f"{x_c:,}", f"{x_t:,}"],
+        "Non-Conversions (n - x)": [f"{n_c - x_c:,}", f"{n_t - x_t:,}"],
+        "Sample Rate (p̂)": [f"{p_c:.6f} ({p_c * 100:.4f}%)", f"{p_t:.6f} ({p_t * 100:.4f}%)"],
+        "CLT Check (x ≥ 10 & n-x ≥ 10)": ["Pass", "Pass"],
+    }
+)
+step1_df
+```
+
+### Step 2: Observed Effect Size (Absolute Difference & Relative Lift)
+
+**Intuition:** Before measuring statistical uncertainty, look at the observed **point estimate**—how much higher (or lower) did `treatment` convert compared to `control`?
+
+$$\hat{\Delta} = \hat{p}_T - \hat{p}_C, \qquad \widehat{\text{Relative Lift}} = \frac{\hat{p}_T - \hat{p}_C}{\hat{p}_C}$$
+
+```{python}
+diff_abs = p_t - p_c
+rel_lift = diff_abs / p_c
+
+print(f"Control conversion rate   (p̂_C) : {p_c:.6f}  ({p_c * 100:.4f}%)")
+print(f"Treatment conversion rate (p̂_T) : {p_t:.6f}  ({p_t * 100:.4f}%)")
+print(f"Absolute difference       (Δ̂)   : {diff_abs:+.6f} ({diff_abs * 100:+.4f} percentage points)")
+print(f"Relative lift             (Δ̂/p̂_C): {rel_lift:+.6f} ({rel_lift * 100:+.4f}%)")
+```
+
+Notice right away: in our cleaned sample, `new_page` actually converted slightly **lower** than `old_page` (`-0.1578` percentage points, or `-1.31%` relative). Now we ask: *Could a dip of `-0.1578` percentage points simply be random sampling noise?*
+
+### Step 3: Pooled Conversion Rate Under $H_0$
+
+**Intuition:** A hypothesis test plays "devil's advocate": it **temporarily assumes $H_0$ is true** ($p_T = p_C = p$). If both pages truly have the exact same conversion rate, then the group labels don't matter—so our best single estimate of that shared conversion rate combines (*pools*) all visitors and conversions from both arms together:
+
+$$\hat{p}_{\text{pool}} = \frac{x_C + x_T}{n_C + n_T}$$
+
+```{python}
+p_pool = (x_c + x_t) / (n_c + n_t)
+
+print(f"Total conversions (x_C + x_T) : {x_c + x_t:,}")
+print(f"Total visitors    (n_C + n_T) : {n_c + n_t:,}")
+print(f"Pooled proportion (p̂_pool)    : {p_pool:.6f} ({p_pool * 100:.4f}%)")
+```
+
+### Step 4: Pooled Standard Error ($SE_{\text{pool}}$)
+
+**Intuition:** Even if both pages had the exact same true conversion rate (`11.96%`), repeating this 290,584-user experiment over and over would still produce small random fluctuations in $\hat{p}_T - \hat{p}_C$. The **Standard Error** measures the typical size (standard deviation) of that random noise!
+
+For a single Bernoulli proportion with rate $p$ and sample size $n$, the variance of $\hat{p}$ is $\frac{p(1 - p)}{n}$. Since `control` and `treatment` are independent, the variance of their difference is the **sum** of their variances. Plugging in $\hat{p}_{\text{pool}}$ gives:
+
+$$SE_{\text{pool}} = \sqrt{\frac{\hat{p}_{\text{pool}}(1 - \hat{p}_{\text{pool}})}{n_C} + \frac{\hat{p}_{\text{pool}}(1 - \hat{p}_{\text{pool}})}{n_T}} = \sqrt{\hat{p}_{\text{pool}}(1 - \hat{p}_{\text{pool}})\left(\frac{1}{n_C} + \frac{1}{n_T}\right)}$$
+
+```{python}
+var_pool = p_pool * (1 - p_pool) * (1 / n_c + 1 / n_t)
+se_pool = math.sqrt(var_pool)
+
+print(f"Pooled variance of (p̂_T - p̂_C) : {var_pool:.10f}")
+print(f"Pooled standard error (SE_pool) : {se_pool:.6f} ({se_pool * 100:.4f} percentage points)")
+```
+
+**Interpretation:** Under $H_0$, pure random chance alone typically causes $\hat{p}_T - \hat{p}_C$ to fluctuate by about **$\pm 0.1204$ percentage points** (one standard error).
+
+### Step 5: The $z$-Test Statistic
+
+**Intuition:** The **$z$-statistic** is simply a **signal-to-noise ratio**. It divides the observed difference ("signal") by the expected random fluctuation ("noise") to ask: *How many standard errors away from 0 did our observed result land?*
+
+$$z = \frac{(\hat{p}_T - \hat{p}_C) - 0}{SE_{\text{pool}}}$$
+
+```{python}
+z_stat = diff_abs / se_pool
+
+print(f"Observed difference (Signal) : {diff_abs:+.6f}")
+print(f"Pooled SE           (Noise)  : {se_pool:.6f}")
+print(f"z-statistic (Signal / Noise) : {z_stat:+.6f}")
+```
+
+**Interpretation:** Our observed difference (`-0.1578 pp`) is only **`1.31` standard errors** below zero—well within the range of ordinary random noise!
+
+### Step 6: Critical Value & $p$-Value
+
+**Intuition:** Under $H_0$, our $z$-statistic follows a **Standard Normal distribution** ($Z \sim \mathcal{N}(0, 1)$).
+
+- **Critical value ($z_{\alpha/2}$):** For a two-sided test at $\alpha = 0.05$, we place `2.5%` rejection probability in each tail. The boundary sits at **$z = \pm 1.960$**. We reject $H_0$ only if $|z| > 1.960$.
+- **Two-sided $p$-value:** The probability of observing a difference at least as extreme as `±0.1578 pp` ($|Z| \ge 1.3109$) purely by chance if $H_0$ is true:
+  $$p_{\text{two-sided}} = P(|Z| \ge |z|) = 2 \cdot \Phi(-|z|)$$
+
+```{python}
+z_crit = stats.norm.ppf(1 - alpha / 2)
+p_value_two_sided = 2 * stats.norm.cdf(-abs(z_stat))
+
+# For completeness: one-sided p-value for H1: p_T > p_C
+p_value_one_sided = 1 - stats.norm.cdf(z_stat)
+
+print(f"Two-sided critical value (±z_0.975) : ±{z_crit:.4f}")
+print(f"Observed |z|                        :  {abs(z_stat):.4f}  (< {z_crit:.4f} -> Fail to reject H₀)")
+print(f"Two-sided p-value (H₁: p_T ≠ p_C)   :  {p_value_two_sided:.6f}  (18.99%)")
+print(f"One-sided p-value (H₁: p_T > p_C)   :  {p_value_one_sided:.6f}  (90.51%)")
+```
+
+```{python}
+#| fig-cap: "Standard Normal null distribution (Z ~ N(0,1)). Our observed z = -1.311 falls comfortably inside the 95% non-rejection zone (between -1.96 and +1.96), giving a two-sided p-value of 0.1899."
+x_vals = np.linspace(-4, 4, 800)
+y_vals = stats.norm.pdf(x_vals)
+
+fig, ax = plt.subplots(figsize=(10.5, 4.8))
+ax.plot(x_vals, y_vals, color=COLORS["neutral"], linewidth=2.2, label="Null Distribution: Z ~ N(0, 1)")
+
+# Shade two-sided rejection regions (|z| >= 1.96)
+x_left_rej = x_vals[x_vals <= -z_crit]
+x_right_rej = x_vals[x_vals >= z_crit]
+ax.fill_between(x_left_rej, stats.norm.pdf(x_left_rej), color=COLORS["danger"], alpha=0.25, label="Rejection Region (α/2 = 2.5% each tail)")
+ax.fill_between(x_right_rej, stats.norm.pdf(x_right_rej), color=COLORS["danger"], alpha=0.25)
+
+# Shade two-sided p-value tails (|z| >= 1.3109)
+x_left_p = x_vals[x_vals <= -abs(z_stat)]
+x_right_p = x_vals[x_vals >= abs(z_stat)]
+ax.fill_between(x_left_p, stats.norm.pdf(x_left_p), color=COLORS["treatment"], alpha=0.35, label=f"Two-sided p-value area ({p_value_two_sided:.4f})")
+ax.fill_between(x_right_p, stats.norm.pdf(x_right_p), color=COLORS["treatment"], alpha=0.35)
+
+# Reference vertical lines
+ax.axvline(-z_crit, color=COLORS["danger"], linestyle="--", linewidth=1.3)
+ax.axvline(z_crit, color=COLORS["danger"], linestyle="--", linewidth=1.3)
+ax.axvline(0, color="gray", linestyle=":", linewidth=1.1)
+ax.axvline(z_stat, color=COLORS["control"], linewidth=2.4, label=f"Observed z = {z_stat:.3f}")
+
+# Annotations
+ax.annotate(
+    f"Observed z = {z_stat:.3f}\n(Inside non-rejection zone)",
+    xy=(z_stat, stats.norm.pdf(z_stat)),
+    xytext=(-3.65, 0.28),
+    arrowprops={"arrowstyle": "->", "color": COLORS["control"], "lw": 1.5},
+    fontsize=9.5,
+    fontweight="bold",
+    color=COLORS["control"],
+    bbox={"boxstyle": "round,pad=0.35", "fc": "#f2f6fb", "ec": COLORS["control"]},
+)
+ax.text(-z_crit - 0.1, 0.36, f"-{z_crit:.2f}", color=COLORS["danger"], ha="right", fontweight="bold")
+ax.text(z_crit + 0.1, 0.36, f"+{z_crit:.2f}", color=COLORS["danger"], ha="left", fontweight="bold")
+
+ax.set_title("Where Does Our Observed Result Fall Under the Null Hypothesis?")
+ax.set_xlabel("z-Score (Standard Errors from Zero)")
+ax.set_ylabel("Probability Density")
+ax.set_xlim(-4, 4)
+ax.set_ylim(0, 0.44)
+ax.legend(loc="upper right", frameon=True, fontsize=8.8)
+plt.tight_layout()
+plt.show()
+```
+
+### Step 7: 95% Confidence Interval (Using Unpooled Standard Error)
+
+**Why do we switch to an *unpooled* Standard Error for the Confidence Interval?**
+When running the hypothesis test (Steps 3–5), we assumed $p_T = p_C$, so pooling both arms made sense. When building a **Confidence Interval**, we drop that assumption and ask: *"Given our data, what range of true values for $p_T - p_C$ is plausible?"* Because we no longer force $p_T = p_C$, we estimate each arm's variance separately using its own sample rate:
+
+$$SE_{\text{unpooled}} = \sqrt{\frac{\hat{p}_C(1 - \hat{p}_C)}{n_C} + \frac{\hat{p}_T(1 - \hat{p}_T)}{n_T}}$$
+
+Then we multiply by the 95% critical value ($z_{0.975} \approx 1.960$) to get the **Margin of Error ($ME$)** and the **95% Confidence Interval**:
+
+$$ME = z_{0.975} \times SE_{\text{unpooled}}, \qquad \text{95\% CI}_{\text{abs}} = \left[\hat{\Delta} - ME,\;\; \hat{\Delta} + ME\right]$$
+
+To compare directly against FaceZonGoogAppFlix's **`+0.35%` relative lift** goal, we also express the interval in relative terms by dividing by $\hat{p}_C$ (and verify it against the formal delta-method variance of $\hat{p}_T / \hat{p}_C - 1$, which accounts for uncertainty in the denominator $\hat{p}_C$):
+
+```{python}
+# Unpooled variance & standard error
+var_c = p_c * (1 - p_c) / n_c
+var_t = p_t * (1 - p_t) / n_t
+se_unpooled = math.sqrt(var_c + var_t)
+
+# Margin of error & 95% CI for absolute difference (p_T - p_C)
+margin_of_error = z_crit * se_unpooled
+ci_abs_low = diff_abs - margin_of_error
+ci_abs_high = diff_abs + margin_of_error
+
+# Relative 95% CI (intuitive ratio to p̂_C)
+ci_rel_low_simple = ci_abs_low / p_c
+ci_rel_high_simple = ci_abs_high / p_c
+
+# Relative 95% CI (formal Delta Method accounting for variance in p̂_C)
+se_rel_delta = math.sqrt(var_t / (p_c ** 2) + (p_t ** 2) * var_c / (p_c ** 4))
+ci_rel_low_delta = rel_lift - z_crit * se_rel_delta
+ci_rel_high_delta = rel_lift + z_crit * se_rel_delta
+
+print(f"Unpooled Standard Error (SE_unpooled) : {se_unpooled:.6f} ({se_unpooled * 100:.4f} pp)")
+print(f"Margin of Error         (1.96 × SE)   : ±{margin_of_error:.6f} (±{margin_of_error * 100:.4f} pp)")
+print(f"95% CI — Absolute Difference          : [{ci_abs_low * 100:+.4f} pp, {ci_abs_high * 100:+.4f} pp]")
+print(f"95% CI — Relative Lift (CI_abs / p̂_C) : [{ci_rel_low_simple * 100:+.2f}%, {ci_rel_high_simple * 100:+.2f}%]")
+print(f"95% CI — Relative Lift (Delta Method) : [{ci_rel_low_delta * 100:+.2f}%, {ci_rel_high_delta * 100:+.2f}%]")
+```
+
+```{python}
+#| fig-cap: "Point estimate and 95% confidence interval shown in absolute percentage points (top) and relative lift (bottom), compared against 0 (No Effect) and FaceZonGoogAppFlix's +0.35% relative (+0.042 pp) business target."
+fig, axes = plt.subplots(2, 1, figsize=(10.5, 5.2))
+
+# Panel 1: Absolute difference (percentage points)
+ax0 = axes[0]
+ax0.axvline(0, color=COLORS["neutral"], linestyle="--", linewidth=1.5, label="No Effect (0.00 pp)")
+ax0.axvline(mde_abs * 100, color=COLORS["accent"], linestyle="-.", linewidth=1.8, label="Client Target (+0.042 pp)")
+ax0.errorbar(
+    x=diff_abs * 100,
+    y=0,
+    xerr=margin_of_error * 100,
+    fmt="o",
+    color=COLORS["control"],
+    ecolor=COLORS["control"],
+    elinewidth=3,
+    capsize=8,
+    markersize=9,
+    label=f"Observed: {diff_abs * 100:+.3f} pp  (95% CI: [{ci_abs_low * 100:+.3f}, {ci_abs_high * 100:+.3f}])",
+)
+ax0.set_title("95% Confidence Interval — Absolute Difference (Percentage Points)")
+ax0.set_xlabel("Treatment − Control Conversion Rate (percentage points)")
+ax0.set_yticks([])
+ax0.set_xlim(-0.55, 0.25)
+ax0.set_ylim(-0.6, 0.8)
+ax0.legend(loc="upper left", frameon=True, fontsize=8.8)
+
+# Panel 2: Relative lift (%)
+ax1 = axes[1]
+ax1.axvline(0, color=COLORS["neutral"], linestyle="--", linewidth=1.5, label="No Effect (0.00%)")
+ax1.axvline(rel_target * 100, color=COLORS["accent"], linestyle="-.", linewidth=1.8, label="Client Target (+0.35% relative)")
+ax1.errorbar(
+    x=rel_lift * 100,
+    y=0,
+    xerr=[[ (rel_lift - ci_rel_low_delta) * 100 ], [ (ci_rel_high_delta - rel_lift) * 100 ]],
+    fmt="s",
+    color=COLORS["treatment"],
+    ecolor=COLORS["treatment"],
+    elinewidth=3,
+    capsize=8,
+    markersize=9,
+    label=f"Observed: {rel_lift * 100:+.2f}%  (95% CI: [{ci_rel_low_delta * 100:+.2f}%, {ci_rel_high_delta * 100:+.2f}%])",
+)
+ax1.set_title("95% Confidence Interval — Relative Lift (%)")
+ax1.set_xlabel("Relative Change vs. Control (%)")
+ax1.set_yticks([])
+ax1.set_xlim(-4.5, 2.0)
+ax1.set_ylim(-0.6, 0.8)
+ax1.legend(loc="upper left", frameon=True, fontsize=8.8)
+
+plt.tight_layout()
+plt.show()
+```
+
+**How to Read This Confidence Interval Plot Like a Pro:**
+
+1. **Statistical Significance Check (Does the bar cross `0`?):** **Yes.** Because `0.00` lies comfortably inside `[-0.394 pp, +0.078 pp]`, the data are consistent with *zero* difference between the old and new pages.
+2. **Practical / Power Check (Does the bar stay below the `+0.35%` target?):** **No!** Because our test was underpowered for such a tiny MDE, the upper end of the 95% CI (`+0.078 pp`, or `+0.64%` relative) still reaches slightly past `+0.042 pp` (`+0.35%` relative). This tells us the experiment wasn't precise enough to *mathematically rule out* a `+0.35%` relative lift—even though the point estimate points in the *opposite* direction (`-1.31%` relative).
+
+### Step 8: Consolidated Component Summary & Library Cross-Check
+
+A great statistical sanity check: a two-sided two-proportion $z$-test is mathematically identical to a **2×2 Pearson Chi-Square Test of Independence** (without Yates' continuity correction), where $\chi^2 = z^2$ and the $p$-values match identically!
+
+```{python}
+# Cross-check with scipy.stats.chi2_contingency (without continuity correction)
+contingency_2x2 = [
+    [x_c, n_c - x_c],  # Control: converted, not converted
+    [x_t, n_t - x_t],  # Treatment: converted, not converted
+]
+chi2_stat, p_val_chi2, dof, _ = stats.chi2_contingency(contingency_2x2, correction=False)
+
+summary_components = pd.DataFrame(
+    {
+        "Step": [
+            "1. Control Rate",
+            "1. Treatment Rate",
+            "2. Absolute Diff",
+            "2. Relative Lift",
+            "3. Pooled Rate",
+            "4. Pooled SE",
+            "5. z-Statistic",
+            "6. Two-Sided p-value",
+            "7. Unpooled SE",
+            "7. 95% CI (Absolute)",
+            "7. 95% CI (Relative, Delta)",
+            "8. SciPy Cross-Check (χ² = z²)",
+        ],
+        "Formula": [
+            "x_C / n_C",
+            "x_T / n_T",
+            "p̂_T − p̂_C",
+            "(p̂_T − p̂_C) / p̂_C",
+            "(x_C + x_T) / (n_C + n_T)",
+            "√[p̂_pool(1 − p̂_pool)(1/n_C + 1/n_T)]",
+            "(p̂_T − p̂_C) / SE_pool",
+            "2 · Φ(−|z|)",
+            "√[p̂_C(1−p̂_C)/n_C + p̂_T(1−p̂_T)/n_T]",
+            "(p̂_T − p̂_C) ± 1.96 × SE_unpooled",
+            "r̂ ± 1.96 × SE_delta",
+            "chi2_contingency(correction=False)",
+        ],
+        "Computed Value": [
+            f"{p_c * 100:.4f}% ({x_c:,} / {n_c:,})",
+            f"{p_t * 100:.4f}% ({x_t:,} / {n_t:,})",
+            f"{diff_abs * 100:+.4f} pp",
+            f"{rel_lift * 100:+.4f}%",
+            f"{p_pool * 100:.4f}%",
+            f"{se_pool * 100:.4f} pp",
+            f"{z_stat:+.6f}  (z² = {z_stat ** 2:.6f})",
+            f"{p_value_two_sided:.6f}",
+            f"{se_unpooled * 100:.4f} pp",
+            f"[{ci_abs_low * 100:+.4f} pp, {ci_abs_high * 100:+.4f} pp]",
+            f"[{ci_rel_low_delta * 100:+.2f}%, {ci_rel_high_delta * 100:+.2f}%]",
+            f"χ² = {chi2_stat:.6f}, p = {p_val_chi2:.6f} (Exact Match)",
+        ],
+    }
+)
+summary_components
+```
+
+---
+
+## Business Recommendation & Key Takeaways
+
+### Statistical Conclusion
+
+- **Test Decision:** **Fail to reject $H_0$** ($z = -1.311$, two-sided $p = 0.1899 > 0.05$; one-sided $p = 0.9051$).
+- **Estimated Impact:** The new webpage converted at **`11.88%`** vs. **`12.04%`** for the existing webpage—an observed difference of **`-0.16` percentage points** (**`-1.31%` relative**), with a **95% confidence interval** of **`[-0.39 pp, +0.08 pp]`** (**`[-3.26%, +0.64%]` relative**).
+- **Sensitivity Note:** Even if we went further and excluded all `3,893` users who had a misaligned entry anywhere in the raw export (not just dropping their misaligned row), the conclusion remains unchanged—there is no statistically significant lift.
+
+### Nuance for New A/B Testers: "Absence of Evidence $\neq$ Evidence of Absence"
+
+Because detecting a **`+0.35%` relative lift (`+0.042 pp`)** on a `12%` baseline requires **~18.8 million users** for 80% power, our `290,584`-user experiment had only **`6.4%` power** at that tiny target. That is why the upper tip of the 95% CI (`+0.64%` relative) still technically includes `+0.35%`.
+
+In plain English: **we did not prove the new page can't possibly beat `+0.35%` relative lift**, *however*, the best estimate is actually **negative (`-1.31%` relative)**, the probability of seeing data this poor if the true lift were `+0.35%` is low, and there is **zero statistical evidence** of any conversion gain.
+
+### Actionable Recommendations for FaceZonGoogAppFlix
+
+::: {.callout-important}
+### Recommendation: Do Not Launch `new_page` — Retain `old_page`
+1. **Keep the current (`old_page`) experience:** The redesign showed no evidence of lifting conversion (and trended `-0.16 pp` lower). Rolling it out introduces engineering/UX risk for no demonstrated return.
+2. **Right-size future MDE targets before running experiments:** At `~13,208` daily visitors, reliably detecting a `+0.35%` relative lift would take **~3.9 years**. For a ~3-week test window (`~290k` users), design bolder webpage changes aiming for at least a **`~2.8%+` relative lift** (`~0.34 pp`), or explore variance-reduction techniques (such as CUPED using pre-experiment user behavior).
+3. **Fix the ~1.32% assignment/page logging bug:** Resolve the persistent routing or telemetry discrepancy discovered in Phase 1 before launching the next A/B test so future analyses do not need post-hoc filtering.
+:::

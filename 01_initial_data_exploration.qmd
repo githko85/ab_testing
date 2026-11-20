@@ -1,0 +1,678 @@
+---
+title: "FaceZonGoogAppFlix Webpage A/B Test"
+subtitle: "Phase 1: Initial Data Exploration & Integrity Audit"
+author: "Data Science Consulting Team"
+date: last-modified
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+jupyter: python3
+---
+
+## Engagement Context & Exploration Objectives
+
+**FaceZonGoogAppFlix** has engaged our consulting team to evaluate a redesigned webpage intended to increase their current **12.00% baseline conversion rate** by **0.35% or more**.
+
+::: {.callout-note}
+### Scope Boundary — Initial Exploration Only
+This report is **strictly limited to Phase 1: Initial Exploratory Data Analysis (EDA)**. Its sole purpose is to understand the structure, completeness, experiment logging integrity, temporal coverage, and raw descriptive patterns in `ab_data.csv`.
+
+**Explicitly deferred to Phase 2:**
+
+- Filtering or mutating records into a final cleaned analysis dataset
+- Formal statistical inference (Sample Ratio Mismatch chi-square tests, two-proportion $z$-tests, $p$-values, confidence intervals)
+- Statistical power / minimum sample-size calculations
+- Any ship / no-ship business recommendation
+:::
+
+::: {.callout-warning}
+### Key Business Clarification Needed Before Phase 2
+The brief specifies increasing conversion from **12%** by **0.35% or more**. Before formal hypothesis testing, we should confirm with FaceZonGoogAppFlix stakeholders whether this target represents:
+
+- **Absolute lift (+0.35 percentage points)**: `12.00%` → `12.35%` (a ~2.92% relative increase), **or**
+- **Relative lift (+0.35%)**: `12.00%` → `12.042%` (+0.042 percentage points).
+:::
+
+---
+
+## Data Loading & Structural Overview
+
+We load the raw export directly from `ab_data.csv/ab_data.csv` (note that `ab_data.csv` in the project directory is an extracted folder containing the CSV file of the same name) without altering or dropping any rows.
+
+```{python}
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+
+# Consistent visual styling for exploratory charts
+sns.set_theme(style="whitegrid", context="notebook")
+PALETTE = {
+    "control": "#2b5c8f",
+    "treatment": "#d95f02",
+    "aligned": "#2a9d8f",
+    "misaligned": "#e76f51",
+}
+
+DATA_PATH = Path("ab_data.csv") / "ab_data.csv"
+raw_df = pd.read_csv(DATA_PATH)
+
+n_rows, n_cols = raw_df.shape
+mem_mb = raw_df.memory_usage(deep=True).sum() / (1024 ** 2)
+
+overview = pd.DataFrame(
+    {
+        "Metric": [
+            "Source File",
+            "Total Rows",
+            "Total Columns",
+            "In-Memory Footprint",
+        ],
+        "Value": [
+            str(DATA_PATH),
+            f"{n_rows:,}",
+            f"{n_cols}",
+            f"{mem_mb:.2f} MB",
+        ],
+    }
+)
+overview
+```
+
+### Schema & Sample Records
+
+```{python}
+schema_df = pd.DataFrame(
+    {
+        "Column": raw_df.columns,
+        "Raw Dtype": [str(dtype) for dtype in raw_df.dtypes],
+        "Non-Null Count": [f"{raw_df[col].notna().sum():,}" for col in raw_df.columns],
+        "Unique Values": [f"{raw_df[col].nunique(dropna=False):,}" for col in raw_df.columns],
+        "Example Value": [raw_df[col].iloc[0] for col in raw_df.columns],
+    }
+)
+schema_df
+```
+
+**Inferred Data Dictionary:**
+
+| Column | Role in Experiment | Expected Domain |
+| :--- | :--- | :--- |
+| `user_id` | Visitor identifier | Unique integer ID per experimental unit |
+| `timestamp` | Event timestamp | ISO-formatted datetime string (microsecond precision) |
+| `group` | Experiment assignment arm | `control` or `treatment` |
+| `landing_page` | Webpage variant actually served | `old_page` (for `control`) or `new_page` (for `treatment`) |
+| `converted` | Primary outcome indicator | Binary integer: `0` (no conversion), `1` (converted) |
+
+Below are the first 5 rows and a reproducible random sample of 5 rows from the raw file.
+
+```{python}
+raw_df.head(5)
+```
+
+```{python}
+raw_df.sample(5, random_state=42)
+```
+
+---
+
+## Data Completeness & Value Validation
+
+Before inspecting experiment assignment integrity, we validate missingness, exact row duplication, categorical/binary domains, and timestamp parseability.
+
+```{python}
+# Parse timestamp into a helper series without overwriting raw columns
+parsed_ts = pd.to_datetime(raw_df["timestamp"], errors="coerce")
+
+validation_summary = pd.DataFrame(
+    {
+        "Check": [
+            "Missing values across all columns",
+            "Exact duplicate rows (all 5 columns identical)",
+            "Unparseable timestamps",
+            "Unexpected `group` values (outside control/treatment)",
+            "Unexpected `landing_page` values (outside old_page/new_page)",
+            "Unexpected `converted` values (outside 0/1)",
+        ],
+        "Count": [
+            int(raw_df.isna().sum().sum()),
+            int(raw_df.duplicated().sum()),
+            int(parsed_ts.isna().sum()),
+            int((~raw_df["group"].isin(["control", "treatment"])).sum()),
+            int((~raw_df["landing_page"].isin(["old_page", "new_page"])).sum()),
+            int((~raw_df["converted"].isin([0, 1])).sum()),
+        ],
+    }
+)
+validation_summary["Status"] = np.where(
+    validation_summary["Count"] == 0, "Pass", "Flagged"
+)
+validation_summary
+```
+
+### Marginal Value Frequencies
+
+```{python}
+def freq_table(series: pd.Series, name: str) -> pd.DataFrame:
+    counts = series.value_counts(dropna=False)
+    pcts = series.value_counts(normalize=True, dropna=False) * 100
+    return pd.DataFrame(
+        {
+            name: counts.index.astype(str),
+            "Count": counts.values,
+            "Share (%)": pcts.values.round(3),
+        }
+    )
+
+pd.concat(
+    [
+        freq_table(raw_df["group"], "Value").assign(Column="group"),
+        freq_table(raw_df["landing_page"], "Value").assign(Column="landing_page"),
+        freq_table(raw_df["converted"], "Value").assign(Column="converted"),
+    ],
+    ignore_index=True,
+)[["Column", "Value", "Count", "Share (%)"]]
+```
+
+**Takeaway:** All five columns are 100% populated with valid domain values and zero exact duplicate rows. At the aggregate level, traffic appears nearly balanced (`control` 49.987% vs. `treatment` 50.013%; `old_page` 50.000% vs. `new_page` 50.000%). However, marginal balance alone can mask assignment-level logging bugs, which we audit next.
+
+---
+
+## Experiment Integrity & Assignment Audit
+
+In a cleanly instrumented A/B test, every `control` user should see `old_page`, every `treatment` user should see `new_page`, and each `user_id` should appear once (unless repeated exposures are explicitly part of the design).
+
+### Group vs. Landing Page Alignment
+
+```{python}
+ct_counts = pd.crosstab(
+    raw_df["group"], raw_df["landing_page"], margins=True, margins_name="Total"
+)
+ct_counts
+```
+
+```{python}
+# Diagnostic flags on an exploratory working copy (raw_df remains untouched)
+eda_df = raw_df.assign(
+    ts=parsed_ts,
+    date=parsed_ts.dt.floor("D"),
+    misaligned=(
+        ((raw_df["group"] == "control") & (raw_df["landing_page"] == "new_page"))
+        | ((raw_df["group"] == "treatment") & (raw_df["landing_page"] == "old_page"))
+    ),
+    is_dup_user=raw_df["user_id"].duplicated(keep=False),
+)
+
+n_misaligned = int(eda_df["misaligned"].sum())
+pct_misaligned = n_misaligned / len(eda_df) * 100
+
+alignment_summary = pd.DataFrame(
+    {
+        "Assignment Status": [
+            "Aligned (control + old_page)",
+            "Aligned (treatment + new_page)",
+            "Misaligned (control + new_page)",
+            "Misaligned (treatment + old_page)",
+            "Total",
+        ],
+        "Rows": [
+            int(((eda_df["group"] == "control") & (eda_df["landing_page"] == "old_page")).sum()),
+            int(((eda_df["group"] == "treatment") & (eda_df["landing_page"] == "new_page")).sum()),
+            int(((eda_df["group"] == "control") & (eda_df["landing_page"] == "new_page")).sum()),
+            int(((eda_df["group"] == "treatment") & (eda_df["landing_page"] == "old_page")).sum()),
+            len(eda_df),
+        ],
+    }
+)
+alignment_summary["Share (%)"] = (alignment_summary["Rows"] / len(eda_df) * 100).round(3)
+alignment_summary
+```
+
+```{python}
+#| fig-cap: "Raw session counts across the four (group, landing_page) combinations, highlighting aligned vs. misaligned records."
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+
+# Left: heatmap of raw counts
+heat_data = pd.crosstab(eda_df["group"], eda_df["landing_page"])[["old_page", "new_page"]]
+sns.heatmap(
+    heat_data,
+    annot=True,
+    fmt=",",
+    cmap="Blues",
+    cbar=False,
+    linewidths=1,
+    ax=axes[0],
+)
+axes[0].set_title("Group vs. Landing Page Counts")
+axes[0].set_xlabel("Landing Page Served")
+axes[0].set_ylabel("Assigned Group")
+
+# Right: zoomed bar chart of misaligned records
+mis_counts = pd.Series(
+    {
+        "control +\nnew_page": int(
+            ((eda_df["group"] == "control") & (eda_df["landing_page"] == "new_page")).sum()
+        ),
+        "treatment +\nold_page": int(
+            ((eda_df["group"] == "treatment") & (eda_df["landing_page"] == "old_page")).sum()
+        ),
+    }
+)
+bars = axes[1].bar(
+    mis_counts.index,
+    mis_counts.values,
+    color=[PALETTE["misaligned"], "#c44536"],
+    width=0.5,
+)
+for bar in bars:
+    h = bar.get_height()
+    axes[1].text(
+        bar.get_x() + bar.get_width() / 2,
+        h + 35,
+        f"{int(h):,}",
+        ha="center",
+        va="bottom",
+        fontweight="bold",
+    )
+axes[1].set_title(f"Misaligned Records Breakdown (Total: {n_misaligned:,} | {pct_misaligned:.2f}%)")
+axes[1].set_ylabel("Row Count")
+axes[1].set_ylim(0, mis_counts.max() * 1.18)
+
+plt.tight_layout()
+plt.show()
+```
+
+### Duplicate `user_id` Audit & Overlap with Misalignment
+
+Next, we inspect how repeated `user_id` entries behave and how they intersect with the `3,893` misaligned rows.
+
+```{python}
+n_unique_users = eda_df["user_id"].nunique()
+n_extra_rows = len(eda_df) - n_unique_users
+user_freq_dist = (
+    eda_df["user_id"]
+    .value_counts()
+    .value_counts()
+    .sort_index()
+    .rename_axis("Appearances per user_id")
+    .reset_index(name="Number of Users")
+)
+user_freq_dist["Total Rows Represented"] = (
+    user_freq_dist["Appearances per user_id"] * user_freq_dist["Number of Users"]
+)
+user_freq_dist
+```
+
+```{python}
+# Cross-tabulate misaligned status against duplicate user_id membership
+overlap_ct = pd.crosstab(
+    eda_df["misaligned"].map({False: "Aligned Row", True: "Misaligned Row"}),
+    eda_df["is_dup_user"].map({False: "Unique user_id", True: "Duplicated user_id"}),
+    margins=True,
+    margins_name="Total",
+)
+overlap_ct
+```
+
+Every single misaligned row (`3,893` of `3,893`) belongs to a duplicated `user_id`. To understand *why* these users appear twice, we classify all `3,894` duplicated users by their assignment pattern across their two records:
+
+```{python}
+dup_rows = eda_df[eda_df["is_dup_user"]].sort_values(["user_id", "ts"])
+dup_user_patterns = (
+    dup_rows.groupby("user_id")
+    .agg(
+        rows=("user_id", "size"),
+        n_groups=("group", "nunique"),
+        n_pages=("landing_page", "nunique"),
+        misaligned_rows=("misaligned", "sum"),
+        distinct_outcomes=("converted", "nunique"),
+    )
+    .value_counts()
+    .reset_index(name="User Count")
+)
+
+def describe_pattern(row: pd.Series) -> str:
+    if row["misaligned_rows"] == 0:
+        return "Both rows aligned (same group & same page)"
+    if row["n_groups"] == 1 and row["n_pages"] == 2:
+        suffix = "same conversion" if row["distinct_outcomes"] == 1 else "conflicting conversion"
+        return f"Same group, saw both pages (1 aligned, 1 misaligned; {suffix})"
+    if row["n_groups"] == 2 and row["n_pages"] == 1:
+        suffix = "same conversion" if row["distinct_outcomes"] == 1 else "conflicting conversion"
+        return f"Switched group, same page (1 aligned, 1 misaligned; {suffix})"
+    return "Other"
+
+dup_user_patterns["Pattern Description"] = dup_user_patterns.apply(describe_pattern, axis=1)
+dup_user_patterns[["Pattern Description", "User Count"]]
+```
+
+#### Concrete Examples of Duplicated User Records
+
+Inspecting concrete examples makes the logging artifact immediately clear:
+
+```{python}
+# Sample one user from each major pattern + the single fully aligned duplicate user
+aligned_only_dup_ids = (
+    eda_df[~eda_df["misaligned"]]
+    .loc[lambda d: d["user_id"].duplicated(keep=False), "user_id"]
+    .unique()
+    .tolist()
+)
+
+same_group_two_pages_id = (
+    dup_rows.groupby("user_id")
+    .filter(lambda g: g["group"].nunique() == 1 and g["landing_page"].nunique() == 2)["user_id"]
+    .iloc[0]
+)
+
+two_groups_same_page_id = (
+    dup_rows.groupby("user_id")
+    .filter(lambda g: g["group"].nunique() == 2 and g["landing_page"].nunique() == 1)["user_id"]
+    .iloc[0]
+)
+
+example_ids = [same_group_two_pages_id, two_groups_same_page_id] + aligned_only_dup_ids
+eda_df[eda_df["user_id"].isin(example_ids)][
+    ["user_id", "timestamp", "group", "landing_page", "converted", "misaligned"]
+].sort_values(["user_id", "timestamp"])
+```
+
+::: {.callout-important}
+### Critical Integrity Discovery
+1. **3,893 users** appear twice with **one aligned record and one misaligned record** — roughly half kept the same `group` while seeing both pages (`1,998` users), and roughly half switched `group` while seeing the same page (`1,895` users). Furthermore, **864 of these users** have conflicting `converted` values (`0` on one row, `1` on the other).
+2. **1 additional user** (`user_id = 773192`) appears twice with **both rows properly aligned** (`treatment` + `new_page`, ~5 days apart).
+3. Simply removing misaligned rows in Phase 2 would still leave that 1 duplicate user unless explicit deduplication rules are applied.
+:::
+
+---
+
+## Temporal Coverage & Traffic Patterns
+
+Next, we inspect the experiment timeline to check duration, boundary-day completeness, daily traffic stability, and whether misaligned logging was a localized incident or an ongoing issue.
+
+```{python}
+ts_min = eda_df["ts"].min()
+ts_max = eda_df["ts"].max()
+duration = ts_max - ts_min
+
+time_summary = pd.DataFrame(
+    {
+        "Metric": [
+            "Earliest Timestamp",
+            "Latest Timestamp",
+            "Total Elapsed Duration",
+            "Calendar Dates Spanned",
+            "Full 24-Hour Interior Dates",
+        ],
+        "Value": [
+            str(ts_min),
+            str(ts_max),
+            f"{duration.days} days, {duration.seconds // 3600} hours, {(duration.seconds % 3600) // 60} minutes",
+            f"{eda_df['date'].nunique()} calendar dates ({ts_min.date()} to {ts_max.date()})",
+            f"{eda_df['date'].nunique() - 2} full days (first and last days are partial)",
+        ],
+    }
+)
+time_summary
+```
+
+```{python}
+daily_stats = (
+    eda_df.groupby("date")
+    .agg(
+        total_rows=("user_id", "size"),
+        control_rows=("group", lambda s: (s == "control").sum()),
+        treatment_rows=("group", lambda s: (s == "treatment").sum()),
+        misaligned_rows=("misaligned", "sum"),
+        raw_conv_rate=("converted", "mean"),
+    )
+    .reset_index()
+)
+daily_stats["misaligned_pct"] = daily_stats["misaligned_rows"] / daily_stats["total_rows"] * 100
+daily_stats["treatment_share_pct"] = daily_stats["treatment_rows"] / daily_stats["total_rows"] * 100
+
+# Display compact summary table of daily traffic
+daily_display = daily_stats.copy()
+daily_display["date"] = daily_display["date"].dt.strftime("%Y-%m-%d")
+daily_display["misaligned_pct"] = daily_display["misaligned_pct"].round(2)
+daily_display["treatment_share_pct"] = daily_display["treatment_share_pct"].round(2)
+daily_display["raw_conv_rate (%)"] = (daily_display["raw_conv_rate"] * 100).round(2)
+daily_display[
+    [
+        "date",
+        "total_rows",
+        "control_rows",
+        "treatment_rows",
+        "treatment_share_pct",
+        "misaligned_rows",
+        "misaligned_pct",
+        "raw_conv_rate (%)",
+    ]
+]
+```
+
+```{python}
+#| fig-cap: "Daily session volume by assigned group (top) and daily misaligned record rate (bottom) across the 22-day window."
+fig, axes = plt.subplots(2, 1, figsize=(11, 7.2), sharex=True)
+
+# Top panel: daily traffic volume by group
+axes[0].plot(
+    daily_stats["date"],
+    daily_stats["control_rows"],
+    marker="o",
+    linewidth=2,
+    color=PALETTE["control"],
+    label="Control",
+)
+axes[0].plot(
+    daily_stats["date"],
+    daily_stats["treatment_rows"],
+    marker="s",
+    linewidth=2,
+    linestyle="--",
+    color=PALETTE["treatment"],
+    label="Treatment",
+)
+axes[0].set_title("Daily Traffic Volume by Assigned Group (Raw Uncleaned Rows)")
+axes[0].set_ylabel("Sessions per Day")
+axes[0].legend(frameon=True)
+axes[0].annotate(
+    "Partial first day\n(starts 13:42)",
+    xy=(daily_stats["date"].iloc[0], daily_stats["control_rows"].iloc[0]),
+    xytext=(daily_stats["date"].iloc[1], 3600),
+    arrowprops={"arrowstyle": "->", "color": "gray"},
+    fontsize=9,
+)
+axes[0].annotate(
+    "Partial last day\n(ends 13:41)",
+    xy=(daily_stats["date"].iloc[-1], daily_stats["control_rows"].iloc[-1]),
+    xytext=(daily_stats["date"].iloc[-5], 4000),
+    arrowprops={"arrowstyle": "->", "color": "gray"},
+    fontsize=9,
+)
+
+# Bottom panel: daily misalignment rate
+overall_mis_pct = eda_df["misaligned"].mean() * 100
+axes[1].bar(
+    daily_stats["date"],
+    daily_stats["misaligned_pct"],
+    color=PALETTE["misaligned"],
+    alpha=0.85,
+    width=0.7,
+)
+axes[1].axhline(
+    overall_mis_pct,
+    color="black",
+    linestyle="--",
+    linewidth=1.3,
+    label=f"Overall Mean ({overall_mis_pct:.2f}%)",
+)
+axes[1].set_title("Daily Misaligned Record Rate (%) — Persistent Throughout Experiment")
+axes[1].set_ylabel("Misaligned Rows (%)")
+axes[1].set_xlabel("Date (2017)")
+axes[1].set_ylim(0, max(daily_stats["misaligned_pct"]) * 1.3)
+axes[1].legend(frameon=True)
+
+axes[1].xaxis.set_major_locator(mdates.DayLocator(interval=2))
+axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+plt.xticks(rotation=35, ha="right")
+plt.tight_layout()
+plt.show()
+```
+
+**Temporal Takeaways:**
+
+- **Duration & stability:** The experiment ran for almost exactly **22.0 days** (`2017-01-02 13:42` to `2017-01-24 13:41`). Across all 21 full interior days, total daily traffic was highly consistent (~`13,000`–`13,564` rows/day) with no visible logging outages, ramp-up periods, or abrupt traffic spikes.
+- **Persistent misalignment:** Misaligned rows occur steadily every single day (`1.18%` to `1.51%` of daily traffic), ruling out a single-day deployment glitch and pointing instead to a persistent routing/logging bug.
+
+---
+
+## Descriptive Conversion Overview (Raw / Uncleaned)
+
+To establish initial descriptive context against FaceZonGoogAppFlix's **12.00% baseline**, we inspect raw conversion rates across groups, landing pages, the full 2×2 breakdown, and daily trends.
+
+::: {.callout-caution}
+### Raw Exploratory Figures Only
+All conversion rates below are computed on the **uncleaned raw dataset** (including misaligned and duplicated records) and carry **no statistical significance claims**. Formal estimation and testing belong in Phase 2 after data-cleaning rules are finalized.
+:::
+
+```{python}
+overall_conv = eda_df["converted"].mean()
+
+by_group = (
+    eda_df.groupby("group", as_index=False)
+    .agg(rows=("converted", "size"), conversions=("converted", "sum"), conv_rate=("converted", "mean"))
+    .assign(dimension="group")
+    .rename(columns={"group": "segment"})
+)
+
+by_page = (
+    eda_df.groupby("landing_page", as_index=False)
+    .agg(rows=("converted", "size"), conversions=("converted", "sum"), conv_rate=("converted", "mean"))
+    .assign(dimension="landing_page")
+    .rename(columns={"landing_page": "segment"})
+)
+
+overall_row = pd.DataFrame(
+    {
+        "dimension": ["overall"],
+        "segment": ["all_rows"],
+        "rows": [len(eda_df)],
+        "conversions": [int(eda_df["converted"].sum())],
+        "conv_rate": [overall_conv],
+    }
+)
+
+marginal_conv = pd.concat([overall_row, by_group, by_page], ignore_index=True)
+marginal_conv["conv_rate (%)"] = (marginal_conv["conv_rate"] * 100).round(3)
+marginal_conv["diff_vs_12pct_baseline (pp)"] = ((marginal_conv["conv_rate"] - 0.12) * 100).round(3)
+marginal_conv[["dimension", "segment", "rows", "conversions", "conv_rate (%)", "diff_vs_12pct_baseline (pp)"]]
+```
+
+### 2×2 Breakdown (`group` × `landing_page`)
+
+```{python}
+cell_conv = (
+    eda_df.groupby(["group", "landing_page"], as_index=False)
+    .agg(rows=("converted", "size"), conversions=("converted", "sum"), conv_rate=("converted", "mean"))
+)
+cell_conv["status"] = np.where(
+    ((cell_conv["group"] == "control") & (cell_conv["landing_page"] == "old_page"))
+    | ((cell_conv["group"] == "treatment") & (cell_conv["landing_page"] == "new_page")),
+    "Aligned",
+    "Misaligned",
+)
+cell_conv["conv_rate (%)"] = (cell_conv["conv_rate"] * 100).round(3)
+cell_conv[["group", "landing_page", "status", "rows", "conversions", "conv_rate (%)"]]
+```
+
+### Daily Raw Conversion Rate Trend by Group
+
+```{python}
+#| fig-cap: "Daily raw conversion rate by assigned group compared against the client's 12.00% historical baseline and a 12.35% (+0.35 pp) reference line."
+daily_group_conv = (
+    eda_df.groupby(["date", "group"], as_index=False)["converted"]
+    .mean()
+    .assign(conv_pct=lambda d: d["converted"] * 100)
+)
+
+fig, ax = plt.subplots(figsize=(11, 4.6))
+for grp, marker, ls in [("control", "o", "-"), ("treatment", "s", "--")]:
+    sub = daily_group_conv[daily_group_conv["group"] == grp]
+    ax.plot(
+        sub["date"],
+        sub["conv_pct"],
+        marker=marker,
+        linestyle=ls,
+        linewidth=2,
+        color=PALETTE[grp],
+        label=f"{grp.title()} (Raw)",
+    )
+
+ax.axhline(12.00, color="#444444", linestyle=":", linewidth=1.4, label="Client Baseline (12.00%)")
+ax.axhline(
+    12.35,
+    color="#2a9d8f",
+    linestyle="-.",
+    linewidth=1.2,
+    label="Reference: 12.35% (+0.35 pp)",
+)
+
+ax.set_title("Daily Raw Conversion Rate by Assigned Group (Uncleaned Data)")
+ax.set_ylabel("Conversion Rate (%)")
+ax.set_xlabel("Date (2017)")
+ax.set_ylim(10.5, 13.5)
+ax.legend(ncol=2, frameon=True, loc="upper right")
+
+ax.xaxis.set_major_locator(mdates.DayLocator(interval=2))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+plt.xticks(rotation=35, ha="right")
+plt.tight_layout()
+plt.show()
+```
+
+**Descriptive Observations:**
+
+- The raw overall conversion rate (`11.97%`) aligns closely with FaceZonGoogAppFlix's stated **12.00%** historical baseline.
+- Descriptively, the raw `treatment` / `new_page` rate (`11.88%`–`11.89%`) sits slightly *below* `control` / `old_page` (`12.04%`–`12.05%`) and below the `12.35%` (+0.35 pp) reference line, with no obvious upward novelty surge across the 22-day period.
+- Whether this observed gap is statistically meaningful—or how cleaning misaligned/duplicated users affects the estimate—must wait for formal Phase 2 analysis.
+
+---
+
+## Summary of Findings & Handoff to Phase 2
+
+### Data Quality & Exploration Summary
+
+| Finding Area | Observation | Severity | Phase 2 Implication |
+| :--- | :--- | :--- | :--- |
+| **File Structure** | CSV is nested at `ab_data.csv/ab_data.csv` (`294,478` rows × `5` cols) | Low | Standardize data path in cleaning pipeline |
+| **Completeness & Schema** | `0` nulls, `0` exact duplicate rows, valid binary target and timestamps | Clean | No imputation required |
+| **Group/Page Misalignment** | `3,893` rows (`1.32%`) have mismatched `group` & `landing_page`, persistently across all 22 days | **High** | Define and justify exclusion rule; verify with client engineering |
+| **Duplicate `user_id`s** | `3,894` users appear twice (`7,788` rows): `3,893` overlap with misaligned rows (`864` with conflicting conversions) + `1` aligned duplicate (`user_id = 773192`) | **High** | Decide whether to drop misaligned rows + deduplicate, or exclude all dual-exposed users completely |
+| **Experiment Window** | ~22.0 days (`2017-01-02 13:42` to `2017-01-24 13:41`); partial first and last calendar days | Medium | Note partial boundary days when running time-sliced diagnostics |
+| **Raw Conversion Context** | Raw control `12.04%` vs. raw treatment `11.89%` (vs. `12.00%` baseline) | Info | Proceed to formal hypothesis test after cleaning |
+
+### Open Questions for FaceZonGoogAppFlix Stakeholders
+
+1. **Target lift definition:** Does "increase 12% by 0.35% or more" mean **+0.35 percentage points** (`12.35%`) or a **+0.35% relative lift** (`12.042%`)?
+2. **Root cause of misaligned logs:** Why did ~1.32% of daily records log a `control` user on `new_page` or a `treatment` user on `old_page`—and why did those exact `3,893` users also receive an aligned record? (e.g., cookie reset, cross-device login, bucketing race condition?)
+3. **Repeat-visit policy:** Should users who were exposed to *both* pages (`1,998` users) or switched groups (`1,895` users) be excluded entirely from the experiment (contaminated units), rather than keeping their aligned row?
+
+### Next Steps (Phase 2 Checklist)
+
+- [ ] Finalize data-cleaning and deduplication rules based on stakeholder input.
+- [ ] Run a formal **Sample Ratio Mismatch (SRM)** check on the cleaned assignment counts.
+- [ ] Perform **power & minimum detectable effect (MDE)** calculations given the confirmed lift definition.
+- [ ] Execute formal **hypothesis testing** (two-proportion test, effect-size confidence interval) and deliver a launch recommendation.
